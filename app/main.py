@@ -26,6 +26,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 async def lifespan(_: FastAPI):
     store.init()
     domain.purge_stale_current(store)
+    domain.purge_stale_qc_current(store)
     yield
 
 
@@ -179,7 +180,7 @@ def mappings_create(
 
 @app.get("/days/{unit}/{day}")
 def day_page(request: Request, unit: str, day: str, msg: str | None = None, ok: str = "1"):
-    with store.read() as conn:
+    with store.snapshot() as conn:
         view = domain.day_view(conn, unit, day)
         items = domain.publish_items(conn, view.publish["id"]) if view.publish else []
     return render(
@@ -228,7 +229,7 @@ def api_days():
 
 @app.get("/api/days/{unit}/{day}")
 def api_day(unit: str, day: str):
-    with store.read() as conn:
+    with store.snapshot() as conn:
         view = domain.day_view(conn, unit, day)
         if view.publish is None:
             reasons = []
@@ -288,7 +289,7 @@ def api_day_csv(unit: str, day: str):
 
     from fastapi.responses import Response
 
-    with store.read() as conn:
+    with store.snapshot() as conn:
         view = domain.day_view(conn, unit, day)
         if view.publish is None:
             reasons = []
@@ -329,6 +330,150 @@ def healthz():
     with store.read() as conn:
         conn.execute("SELECT 1")
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Adjacent-day quality check
+# --------------------------------------------------------------------------- #
+
+@app.get("/qc")
+def qc_page(
+    request: Request,
+    unit: str | None = None,
+    day: str | None = None,
+    msg: str | None = None,
+    ok: str = "1",
+):
+    view = None
+    error = None
+    with store.snapshot() as conn:
+        units = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT unit FROM events ORDER BY unit"
+            ).fetchall()
+        ]
+        if unit and day:
+            try:
+                view = domain.qc_view(conn, unit, day)
+            except domain.DomainError as exc:
+                error = str(exc)
+    return render(
+        request,
+        "qc.html",
+        view=view,
+        units=units,
+        unit=unit or "",
+        day=day or "",
+        error=error,
+        msg=msg,
+        ok=ok == "1",
+    )
+
+
+@app.post("/qc/{unit}/{start_day}/recompute")
+def qc_recompute(
+    request: Request,
+    unit: str,
+    start_day: str,
+    source_token: str = Form(""),
+):
+    try:
+        domain.qc_recompute(store, unit, start_day, source_token)
+    except domain.DomainError as exc:
+        return flash_redirect(
+            f"/qc?unit={quote(unit)}&day={quote(start_day)}", str(exc), ok=False
+        )
+    return flash_redirect(
+        f"/qc?unit={quote(unit)}&day={quote(start_day)}",
+        "已按当前两日现行日档重算质检结论",
+    )
+
+
+@app.get("/qc/reports/{report_id}")
+def qc_report_page(request: Request, report_id: int):
+    """Read-only review of a past conclusion, including revoked ones."""
+    with store.snapshot() as conn:
+        report = domain.qc_report(conn, report_id)
+        if report is None:
+            return render(
+                request,
+                "qc_report.html",
+                report=None,
+                pairs=[],
+                current=False,
+                error=f"质检结论 #{report_id} 不存在",
+                msg=None,
+                ok=True,
+            )
+        pairs = domain.qc_pairs(conn, report_id)
+        live = domain.qc_current_report(conn, report["unit"], report["start_day"])
+        current = live is not None and live["id"] == report_id
+    return render(
+        request,
+        "qc_report.html",
+        report=report,
+        pairs=pairs,
+        current=current,
+        error=None,
+        msg=None,
+        ok=True,
+    )
+
+
+@app.get("/api/qc/{unit}/{start_day}")
+def api_qc(unit: str, start_day: str):
+    with store.snapshot() as conn:
+        try:
+            view = domain.qc_view(conn, unit, start_day)
+        except domain.DomainError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        if view.report is None:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "unit": unit,
+                    "start_day": start_day,
+                    "day_a": view.day_a,
+                    "day_b": view.day_b,
+                    "available": False,
+                    "reasons": view.reasons or ["尚未生成质检结论"],
+                },
+            )
+        pairs = [
+            {
+                "firmware_version": p["firmware_version"],
+                "fault_code": p["fault_code"],
+                "early": {
+                    "event_no": p["early_event_no"],
+                    "revision": p["early_revision"],
+                    "occurred_at": p["early_at"],
+                    "publish_id": p["source_publish_early"],
+                },
+                "late": {
+                    "event_no": p["late_event_no"],
+                    "revision": p["late_revision"],
+                    "occurred_at": p["late_at"],
+                    "publish_id": p["source_publish_late"],
+                },
+                "delta_seconds": p["delta_us"] / 1_000_000,
+            }
+            for p in view.pairs
+        ]
+        return {
+            "unit": unit,
+            "start_day": start_day,
+            "day_a": view.day_a,
+            "day_b": view.day_b,
+            "available": True,
+            "report_id": view.report["id"],
+            "created_at": view.report["created_at"],
+            "source_token": view.report["source_token"],
+            "publish_a_id": view.report["publish_a_id"],
+            "publish_b_id": view.report["publish_b_id"],
+            "pair_count": view.report["pair_count"],
+            "pairs": pairs,
+        }
 
 
 @app.get("/status")

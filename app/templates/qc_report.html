@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}质检结论 #{{ report.id if report else '' }}{% endblock %}
+{% block content %}
+{% if error %}
+<h1>质检结论复查</h1>
+<div class="banner bad">{{ error }}</div>
+{% else %}
+<h1>质检结论 #{{ report.id }}</h1>
+<p><a href="/qc?unit={{ report.unit }}&day={{ report.start_day }}">返回该机组的质检页</a></p>
+
+<div class="banner {{ 'ok' if current else 'warn' }}">
+  {% if current %}
+    该结论仍具现行资格。
+  {% else %}
+    该结论已失去现行资格，仅供复查，不能作为供数依据。
+    {% if report.status == 'REVOKED' %}
+      （撤销时刻 {{ report.revoked_at }}，原因：{{ report.revoked_reason }}）
+    {% endif %}
+  {% endif %}
+</div>
+
+<table>
+  <tbody>
+    <tr><th>机组</th><td>{{ report.unit }}</td></tr>
+    <tr><th>质检范围（UTC）</th><td>{{ report.day_a }} ~ {{ report.day_b }}</td></tr>
+    <tr><th>来源日档</th><td>#{{ report.publish_a_id }}（{{ report.day_a }}）/ #{{ report.publish_b_id }}（{{ report.day_b }}）</td></tr>
+    <tr><th>依据</th><td><code>{{ report.source_token }}</code></td></tr>
+    <tr><th>生成时刻</th><td>{{ report.created_at }}</td></tr>
+    <tr><th>疑点数</th><td>{{ report.pair_count }}</td></tr>
+    <tr><th>状态</th><td>{{ report.status }}</td></tr>
+  </tbody>
+</table>
+
+{% if pairs %}
+<h2>疑点事件对（{{ pairs | length }}）</h2>
+<table>
+  <thead>
+    <tr>
+      <th>固件版本</th><th>故障码</th>
+      <th>较早事件号</th><th>较早时刻（UTC）</th><th>来源日档</th>
+      <th>较晚事件号</th><th>较晚时刻（UTC）</th><th>来源日档</th>
+      <th>间隔</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for p in pairs %}
+    <tr>
+      <td>{{ p.firmware_version }}</td>
+      <td>{{ p.fault_code }}</td>
+      <td>{{ p.early_event_no }} <span class="muted">r{{ p.early_revision }}</span></td>
+      <td>{{ p.early_at }}</td>
+      <td>#{{ p.source_publish_early }}</td>
+      <td>{{ p.late_event_no }} <span class="muted">r{{ p.late_revision }}</span></td>
+      <td>{{ p.late_at }}</td>
+      <td>#{{ p.source_publish_late }}</td>
+      <td>{{ '%.3f' | format(p.delta_us / 1000000) }} 秒</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">该结论记录时没有符合条件的事件对。</p>
+{% endif %}
+{% endif %}
+{% endblock %}

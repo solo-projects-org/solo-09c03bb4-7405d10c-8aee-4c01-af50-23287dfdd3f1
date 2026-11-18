@@ -37,6 +37,8 @@ pytest
 | `/events` | 录入事件号、递增修订号、机组、固件版本、故障码、UTC 时刻 |
 | `/mappings` | 维护固件版本 + 故障码的递增类别映射修订 |
 | `/days/{unit}/{day}` | 单日：现行事件、缺映射清单、重算发布、历史撤销记录 |
+| `/qc` | 相邻两日质检：选机组与起始 UTC 日，找出疑似重传事件对 |
+| `/qc/reports/{id}` | 复查某次质检结论（含已撤销的） |
 | `/status` | JSON：现行日档 / 待重算日档 / 最近操作日志 |
 
 给分析组的只读接口：
@@ -46,6 +48,7 @@ pytest
 | `GET /api/days` | 当前可用的日档列表 |
 | `GET /api/days/{unit}/{day}` | 现行日档内容；不可用时返回 `409` 和原因 |
 | `GET /api/days/{unit}/{day}/export.csv` | 同内容 CSV 下载 |
+| `GET /api/qc/{unit}/{start_day}` | 相邻两日质检结论；两日任一日档不可用或结论失效时返回 `409` |
 | `GET /healthz` | 存活检查（Compose healthcheck 使用） |
 
 ## 规则与实现对应
@@ -78,6 +81,30 @@ pytest
    `CREATE UNIQUE INDEX ... WHERE status='CURRENT'` 作为每机组每日仅一份现行的兜底。
 9. **审计**：`publishes` 只追加不删除，撤销保留时间与原因；`publish_items` 保留当时
    使用的类别与映射修订，可在 `/days/...` 页面查看历史日档；`operation_log` 记录操作。
+
+## 相邻两日质检（疑似重传）
+
+`/qc?unit=...&day=YYYY-MM-DD` 以「起始 UTC 日 + 次日」的两份**现行日档**为输入，把两份
+日档的明细合在一起，按 `(固件版本, 故障码)` 分组，找出发生时间相差不超过 60 秒
+（含正好 60 秒）的事件对。跨午夜的事件对因此能自然配出，因为配对发生在两日合并后的
+集合上，而非各自日内。结果展示双方事件号、修订、时刻与来源发布号（`publish_id`）。
+
+1. **两天不齐备不下结论**：任一天没有现行日档（未发布、缺映射、已撤销或与当前数据
+   不一致）时，页面明确说明哪一天、什么原因，重算接口直接拒绝；`/api/qc/...` 返回
+   `409`，不会返回「无疑点」。
+2. **结论只对同一组现行发布有效**：重算在 `BEGIN IMMEDIATE` 事务内校验提交的
+   `source_token`（两份 `publish_id` + 各自的 `event_revisions` + `recipe`），并与事务内
+   实时数据逐字比对；期间有任何事件更正、映射修订或重新发布即拒绝（`app/domain.py:qc_recompute`）。
+3. **来源变动立即撤销**：`revoke_day_locked` 在同一条 UPDATE 之后调用
+   `revoke_qc_for_day_locked`，凡把该日作为来源的现行结论在同一事务内转为 `REVOKED`，
+   不存在「日档已撤销但质检仍现行」的瞬间。撤销原因记录具体日期与触发动作。
+4. **失败/重启不能复活旧结论**：插入新结论前先撤销旧结论，全部写入要么提交要么回滚；
+   启动时 `purge_stale_qc_current` 只把不一致的 `CURRENT` 结论降级，绝不升级。
+   `CREATE UNIQUE INDEX ... WHERE status='CURRENT'` 保证每机组每个起始日仅一份现行结论。
+5. **可复查**：`qc_reports` / `qc_pairs` 只追加，`/qc/reports/{id}` 可查看已撤销结论的
+   事件对与撤销原因；历史表按时间倒序列出全部结论。
+
+日档的供数接口（`/api/days...`）与质检完全解耦，质检存在与否不影响原有取数。
 
 ## 已知限制
 

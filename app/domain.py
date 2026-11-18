@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 
 from .db import Store, log, utc_now_iso
@@ -18,6 +19,7 @@ EVENT_NO_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._: -]{1,64}$")
 CODE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,32}$")
 CATEGORY_RE = re.compile(r"^[^\x00-\x1f]{1,64}$")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class DomainError(Exception):
@@ -304,6 +306,11 @@ def revoke_day_locked(
         " WHERE unit = ? AND day = ? AND status = 'CURRENT'",
         (utc_now_iso(), reason, unit, day),
     )
+    # Any quality-check conclusion that consumed this day as a source loses its
+    # current status in the very same transaction.  A conclusion is only valid
+    # for the exact published files it was computed from, so it must never
+    # survive a revocation and later be mistaken for a fresh result.
+    revoke_qc_for_day_locked(conn, unit, day, f"来源日档 {unit} {day} 变动：{reason}")
     return cur.rowcount
 
 
@@ -492,6 +499,444 @@ def publish_items(conn: sqlite3.Connection, publish_id: int) -> list[sqlite3.Row
         "SELECT * FROM publish_items WHERE publish_id = ? ORDER BY occurred_at, event_no",
         (publish_id,),
     ).fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# Adjacent-day quality check (suspect retransmissions)
+# --------------------------------------------------------------------------- #
+
+QC_WINDOW_US = 60 * 1_000_000
+
+
+@dataclass(frozen=True)
+class QcPair:
+    firmware_version: str
+    fault_code: str
+    early_event_no: str
+    early_revision: int
+    early_at: str
+    late_event_no: str
+    late_revision: int
+    late_at: str
+    delta_us: int
+    source_publish_early: int
+    source_publish_late: int
+
+
+@dataclass
+class QcDaySource:
+    day: str
+    publish: sqlite3.Row | None
+    revoked: list[sqlite3.Row]
+    reasons: list[str]
+
+
+@dataclass
+class QcView:
+    unit: str
+    start_day: str
+    day_a: str
+    day_b: str
+    source_a: QcDaySource
+    source_b: QcDaySource
+    report: sqlite3.Row | None = None       # CURRENT and still coherent
+    invalid_report: sqlite3.Row | None = None  # CURRENT row that fails coherence
+    history: list[sqlite3.Row] = field(default_factory=list)
+    pairs: list[sqlite3.Row] = field(default_factory=list)
+
+    @property
+    def available(self) -> bool:
+        return self.report is not None
+
+    @property
+    def source_token(self) -> str:
+        """Token the browser must echo back; empty while either source is absent."""
+        if self.source_a.publish is None or self.source_b.publish is None:
+            return ""
+        return qc_source_token(self.source_a.publish, self.source_b.publish)
+
+    @property
+    def reasons(self) -> list[str]:
+        out = list(self.source_a.reasons) + list(self.source_b.reasons)
+        if self.invalid_report is not None:
+            out.append("现行结论与来源日档不再一致，已失去现行资格")
+        return out
+
+
+def parse_day(value: str) -> str:
+    raw = (value or "").strip()
+    if not DAY_RE.match(raw):
+        raise DomainError(f"UTC 日格式不合法: {value!r}（须为 YYYY-MM-DD）")
+    try:
+        date.fromisoformat(raw)
+    except ValueError:
+        raise DomainError(f"UTC 日不是有效日期: {value!r}") from None
+    return raw
+
+
+def next_day(day: str) -> str:
+    try:
+        return (date.fromisoformat(parse_day(day)) + timedelta(days=1)).isoformat()
+    except OverflowError:
+        raise DomainError(f"起始日 {day} 之后没有可用日期（超出可表示范围）") from None
+
+
+def _qc_day_source(conn: sqlite3.Connection, unit: str, day: str) -> QcDaySource:
+    publish = conn.execute(
+        "SELECT * FROM publishes WHERE unit = ? AND day = ? AND status = 'CURRENT'",
+        (unit, day),
+    ).fetchone()
+    revoked = conn.execute(
+        "SELECT * FROM publishes WHERE unit = ? AND day = ? AND status = 'REVOKED'"
+        " ORDER BY created_at DESC",
+        (unit, day),
+    ).fetchall()
+    reasons: list[str] = []
+    if publish is not None:
+        # Defence in depth: the boot guard already demotes such rows, but a
+        # conclusion must never be computed from a file that does not match the
+        # live revision set (e.g. a hand-edited database).
+        view = day_view(conn, unit, day)
+        if (
+            view.missing
+            or view.recipe != publish["recipe"]
+            or revision_token(view.events) != publish["event_revisions"]
+        ):
+            publish = None
+            reasons.append(f"{day} 的现行日档与当前数据不一致，须重新发布")
+    if publish is None and not reasons:
+        has_events = conn.execute(
+            "SELECT 1 FROM events WHERE unit = ? AND substr(occurred_at, 1, 10) = ?"
+            " LIMIT 1",
+            (unit, day),
+        ).fetchone()
+        missing = conn.execute(
+            "SELECT COUNT(*) FROM events e"
+            " JOIN (SELECT event_no, MAX(revision) AS r FROM events GROUP BY event_no) m"
+            "   ON m.event_no = e.event_no AND m.r = e.revision"
+            " WHERE e.unit = ? AND substr(e.occurred_at, 1, 10) = ?"
+            "   AND NOT EXISTS (SELECT 1 FROM mappings mp"
+            "     WHERE mp.firmware_version = e.firmware_version"
+            "       AND mp.fault_code = e.fault_code)",
+            (unit, day),
+        ).fetchone()[0]
+        if not has_events:
+            reasons.append(f"{day} 当天无可供质检的事件")
+        elif missing:
+            reasons.append(f"{day} 存在缺少类别映射的事件，整日尚未发布")
+        elif revoked:
+            reasons.append(f"{day} 现行资格已撤销，等待重算发布")
+        else:
+            reasons.append(f"{day} 尚未发布")
+    return QcDaySource(day, publish, revoked, reasons)
+
+
+def qc_source_token(publish_a: sqlite3.Row, publish_b: sqlite3.Row) -> str:
+    return "|".join(
+        f"{p['id']}:{p['event_revisions']}:{p['recipe']}"
+        for p in (publish_a, publish_b)
+    )
+
+
+def qc_pair_rows(
+    conn: sqlite3.Connection, publish_a: sqlite3.Row, publish_b: sqlite3.Row
+) -> list[QcPair]:
+    """All event pairs from the two published files sharing firmware + fault code
+    whose timestamps are within 60 s.  Both intra-day and cross-midnight pairs are
+    included because both files' items are pooled before pairing."""
+    rows = conn.execute(
+        "SELECT event_no, revision, firmware_version, fault_code, occurred_at,"
+        " publish_id FROM publish_items WHERE publish_id IN (?, ?)",
+        (publish_a["id"], publish_b["id"]),
+    ).fetchall()
+
+    groups: dict[tuple[str, str], list[tuple[int, sqlite3.Row]]] = defaultdict(list)
+    for row in rows:
+        ts = parse_utc(row["occurred_at"])
+        delta = ts - datetime(1970, 1, 1, tzinfo=timezone.utc)
+        ts_us = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+        groups[(row["firmware_version"], row["fault_code"])].append((ts_us, row))
+
+    pairs: list[QcPair] = []
+    for (fw, code), items in groups.items():
+        items.sort(key=lambda t: (t[0], t[1]["event_no"]))
+        for i, (early_us, early) in enumerate(items):
+            j = i + 1
+            while j < len(items):
+                late_us, late = items[j]
+                delta = late_us - early_us
+                if delta > QC_WINDOW_US:
+                    break
+                # Identical event numbers should never appear in two day files;
+                # if data is corrupt, never pair an event with itself.
+                if early["event_no"] != late["event_no"]:
+                    pairs.append(
+                        QcPair(
+                            firmware_version=fw,
+                            fault_code=code,
+                            early_event_no=early["event_no"],
+                            early_revision=early["revision"],
+                            early_at=early["occurred_at"],
+                            late_event_no=late["event_no"],
+                            late_revision=late["revision"],
+                            late_at=late["occurred_at"],
+                            delta_us=delta,
+                            source_publish_early=early["publish_id"],
+                            source_publish_late=late["publish_id"],
+                        )
+                    )
+                j += 1
+    pairs.sort(
+        key=lambda p: (p.early_at, p.early_event_no, p.late_at, p.late_event_no)
+    )
+    return pairs
+
+
+def _revoke_qc_locked(conn: sqlite3.Connection, report_id: int, reason: str) -> None:
+    conn.execute(
+        "UPDATE qc_reports SET status = 'REVOKED', revoked_at = ?, revoked_reason = ?"
+        " WHERE id = ? AND status = 'CURRENT'",
+        (utc_now_iso(), reason, report_id),
+    )
+
+
+def revoke_qc_for_day_locked(
+    conn: sqlite3.Connection, unit: str, day: str, reason: str
+) -> int:
+    """Revoke every current conclusion that consumed (unit, day) as a source.
+
+    Called from ``revoke_day_locked`` so the source publish and the conclusion
+    that depended on it change state in one transaction: there is no instant at
+    which a revoked daily file still has a "current" quality-check result.
+    """
+    rows = conn.execute(
+        "SELECT id FROM qc_reports WHERE unit = ? AND status = 'CURRENT'"
+        " AND (day_a = ? OR day_b = ?)",
+        (unit, day, day),
+    ).fetchall()
+    for row in rows:
+        _revoke_qc_locked(conn, row["id"], reason)
+    return len(rows)
+
+
+def qc_current_report(
+    conn: sqlite3.Connection, unit: str, start_day: str
+) -> sqlite3.Row | None:
+    """The CURRENT conclusion, only if both source publishes are still CURRENT
+    and unchanged.  A stale row is reported as not current, never upgraded."""
+    report = conn.execute(
+        "SELECT * FROM qc_reports WHERE unit = ? AND start_day = ? AND status = 'CURRENT'",
+        (unit, start_day),
+    ).fetchone()
+    if report is None:
+        return None
+    a = conn.execute(
+        "SELECT * FROM publishes WHERE id = ? AND status = 'CURRENT'",
+        (report["publish_a_id"],),
+    ).fetchone()
+    b = conn.execute(
+        "SELECT * FROM publishes WHERE id = ? AND status = 'CURRENT'",
+        (report["publish_b_id"],),
+    ).fetchone()
+    if a is None or b is None:
+        return None
+    if (
+        a["unit"] != report["unit"]
+        or b["unit"] != report["unit"]
+        or a["day"] != report["day_a"]
+        or b["day"] != report["day_b"]
+    ):
+        return None
+    if qc_source_token(a, b) != report["source_token"]:
+        return None
+    return report
+
+
+def qc_view(conn: sqlite3.Connection, unit: str, start_day: str) -> QcView:
+    start = parse_day(start_day)
+    day_a, day_b = start, next_day(start)
+    source_a = _qc_day_source(conn, unit, day_a)
+    source_b = _qc_day_source(conn, unit, day_b)
+    history = conn.execute(
+        "SELECT * FROM qc_reports WHERE unit = ? AND start_day = ?"
+        " ORDER BY created_at DESC, id DESC",
+        (unit, start),
+    ).fetchall()
+    current_row = next((r for r in history if r["status"] == "CURRENT"), None)
+    report = qc_current_report(conn, unit, start)
+    invalid = current_row if current_row is not None and report is None else None
+    pairs = (
+        conn.execute(
+            "SELECT * FROM qc_pairs WHERE report_id = ? ORDER BY early_at,"
+            " early_event_no, late_at, late_event_no",
+            (report["id"],),
+        ).fetchall()
+        if report is not None
+        else []
+    )
+    return QcView(
+        unit=unit,
+        start_day=start,
+        day_a=day_a,
+        day_b=day_b,
+        source_a=source_a,
+        source_b=source_b,
+        report=report,
+        invalid_report=invalid,
+        history=list(history),
+        pairs=list(pairs),
+    )
+
+
+def qc_recompute(
+    store: Store, unit: str, start_day: str, source_token_in: str
+) -> int:
+    """Recompute a two-day quality check from the *currently published* files.
+
+    The whole verify-compute-insert runs under one ``BEGIN IMMEDIATE``
+    transaction, and the token shown to the operator pins both publish ids and
+    their exact event/mapping revision basis.  If an event correction, mapping
+    revision or republish interleaves, either this transaction saw the new state
+    (and the token check fails) or the later writer revokes the conclusion we
+    just created - never a result stitched from two different publish sets.
+    """
+    unit = _require(unit, "机组", TOKEN_RE)
+    start = parse_day(start_day)
+    day_b = next_day(start)
+
+    with store.write() as conn:
+        source_a = _qc_day_source(conn, unit, start)
+        source_b = _qc_day_source(conn, unit, day_b)
+        reasons = source_a.reasons + source_b.reasons
+        if reasons:
+            raise DomainError(
+                "两天日档不齐备，不能给出质检结论：" + "；".join(reasons)
+            )
+        assert source_a.publish is not None and source_b.publish is not None
+        live_token = qc_source_token(source_a.publish, source_b.publish)
+        if (source_token_in or "").strip() != live_token:
+            raise Conflict(
+                "质检所依据的日档已变化（期间有更正、映射修订或重新发布），"
+                "请重新核对后再重算"
+            )
+
+        pairs = qc_pair_rows(conn, source_a.publish, source_b.publish)
+
+        # Replacing a conclusion is revocation first, then insert: a failure to
+        # insert rolls everything back and the older conclusion stays REVOKED
+        # (it was revoked when its source changed, and is never promoted back).
+        old = conn.execute(
+            "SELECT id FROM qc_reports WHERE unit = ? AND start_day = ?"
+            " AND status = 'CURRENT'",
+            (unit, start),
+        ).fetchone()
+        if old is not None:
+            _revoke_qc_locked(conn, old["id"], "被新的质检重算取代")
+
+        cur = conn.execute(
+            "INSERT INTO qc_reports (unit, start_day, day_a, day_b, publish_a_id,"
+            " publish_b_id, source_token, pair_count, status, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CURRENT', ?)",
+            (
+                unit,
+                start,
+                start,
+                day_b,
+                source_a.publish["id"],
+                source_b.publish["id"],
+                live_token,
+                len(pairs),
+                utc_now_iso(),
+            ),
+        )
+        report_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO qc_pairs (report_id, firmware_version, fault_code,"
+            " early_event_no, early_revision, early_at, late_event_no,"
+            " late_revision, late_at, delta_us, source_publish_early,"
+            " source_publish_late) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    report_id,
+                    p.firmware_version,
+                    p.fault_code,
+                    p.early_event_no,
+                    p.early_revision,
+                    p.early_at,
+                    p.late_event_no,
+                    p.late_revision,
+                    p.late_at,
+                    p.delta_us,
+                    p.source_publish_early,
+                    p.source_publish_late,
+                )
+                for p in pairs
+            ],
+        )
+        log(
+            conn,
+            "qc.create",
+            f"{unit} {start}~{day_b} id={report_id} pairs={len(pairs)}"
+            f" pubs={source_a.publish['id']},{source_b.publish['id']}",
+        )
+        return report_id
+
+
+def qc_pairs(conn: sqlite3.Connection, report_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_pairs WHERE report_id = ? ORDER BY early_at,"
+        " early_event_no, late_at, late_event_no",
+        (report_id,),
+    ).fetchall()
+
+
+def qc_reports(conn: sqlite3.Connection, unit: str, start_day: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_reports WHERE unit = ? AND start_day = ?"
+        " ORDER BY created_at DESC, id DESC",
+        (unit, start_day),
+    ).fetchall()
+
+
+def qc_report(conn: sqlite3.Connection, report_id: int) -> sqlite3.Row | None:
+    """One conclusion by id, current or revoked, for review."""
+    return conn.execute(
+        "SELECT * FROM qc_reports WHERE id = ?", (report_id,)
+    ).fetchone()
+
+
+def purge_stale_qc_current(store: Store) -> int:
+    """Boot guard: demote qc conclusions whose source publishes are no longer
+    current or no longer match the recorded basis.  Never promotes anything."""
+    with store.write() as conn:
+        rows = conn.execute(
+            "SELECT * FROM qc_reports WHERE status = 'CURRENT'"
+        ).fetchall()
+        revoked = 0
+        for row in rows:
+            a = conn.execute(
+                "SELECT * FROM publishes WHERE id = ? AND status = 'CURRENT'",
+                (row["publish_a_id"],),
+            ).fetchone()
+            b = conn.execute(
+                "SELECT * FROM publishes WHERE id = ? AND status = 'CURRENT'",
+                (row["publish_b_id"],),
+            ).fetchone()
+            if (
+                a is None
+                or b is None
+                or qc_source_token(a, b) != row["source_token"]
+                or a["unit"] != row["unit"]
+                or b["unit"] != row["unit"]
+                or a["day"] != row["day_a"]
+                or b["day"] != row["day_b"]
+            ):
+                _revoke_qc_locked(conn, row["id"], "启动校验：质检来源日档已不一致")
+                revoked += 1
+        if revoked:
+            log(conn, "startup.qc_revoke", f"{revoked} stale qc conclusion(s) revoked")
+        return revoked
+
 
 
 def all_publishes(conn: sqlite3.Connection) -> list[sqlite3.Row]:

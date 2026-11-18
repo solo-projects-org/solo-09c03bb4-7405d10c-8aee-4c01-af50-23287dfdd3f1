@@ -93,6 +93,54 @@ CREATE TABLE IF NOT EXISTS operation_log (
     action      TEXT    NOT NULL,
     detail      TEXT    NOT NULL
 );
+
+-- Quality-check conclusions for a pair of adjacent UTC days.  A conclusion is
+-- *current* only while both source publishes are CURRENT *and* the exact
+-- publish/revision basis it was computed from is unchanged.  It is never
+-- deleted, so a revoked conclusion remains reviewable.
+CREATE TABLE IF NOT EXISTS qc_reports (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    unit           TEXT    NOT NULL,
+    start_day      TEXT    NOT NULL,          -- YYYY-MM-DD; second day is +1
+    day_a          TEXT    NOT NULL,
+    day_b          TEXT    NOT NULL,
+    publish_a_id   INTEGER NOT NULL REFERENCES publishes(id),
+    publish_b_id   INTEGER NOT NULL REFERENCES publishes(id),
+    source_token   TEXT    NOT NULL,          -- publish ids + event/mapping basis
+    pair_count     INTEGER NOT NULL,
+    status         TEXT    NOT NULL CHECK (status IN ('CURRENT', 'REVOKED')),
+    created_at     TEXT    NOT NULL,
+    revoked_at     TEXT,
+    revoked_reason TEXT
+);
+
+-- At most one CURRENT quality-check conclusion per (unit, start day).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_qc_reports_one_current
+    ON qc_reports (unit, start_day) WHERE status = 'CURRENT';
+
+CREATE INDEX IF NOT EXISTS idx_qc_reports_publish_a
+    ON qc_reports (publish_a_id);
+CREATE INDEX IF NOT EXISTS idx_qc_reports_publish_b
+    ON qc_reports (publish_b_id);
+
+CREATE TABLE IF NOT EXISTS qc_pairs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id            INTEGER NOT NULL REFERENCES qc_reports(id),
+    firmware_version     TEXT    NOT NULL,
+    fault_code           TEXT    NOT NULL,
+    early_event_no       TEXT    NOT NULL,
+    early_revision       INTEGER NOT NULL,
+    early_at             TEXT    NOT NULL,
+    late_event_no        TEXT    NOT NULL,
+    late_revision        INTEGER NOT NULL,
+    late_at              TEXT    NOT NULL,
+    delta_us             INTEGER NOT NULL,
+    source_publish_early INTEGER NOT NULL,
+    source_publish_late  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_qc_pairs_report
+    ON qc_pairs (report_id);
 """
 
 
@@ -146,6 +194,27 @@ class Store:
         conn = self.connect()
         try:
             yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Read-only transaction: every query in the block sees one committed
+        state.  Used where several queries must agree with each other (e.g. a
+        quality-check conclusion must be reported together with the exact
+        source publishes it consumed).  SQLite defers the read lock until the
+        first query, so this never blocks writers."""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()
 
